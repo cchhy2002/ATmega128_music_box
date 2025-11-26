@@ -11,6 +11,9 @@
 
 
 // PE4 PWM, PE5 IN1, PE6 IN2 으로 사용. TimerC 사용 + PB3:0 포트의 액티브-로우 버튼 사용
+// L298N 기준으로 PE4는 ENA, PE5는 IN1, PE6은 IN2에 연결
+
+// 포트 입출력 설정, PWM 제어 레지스터 초기화
 void GPIO_PWM_init()
 {
 	PORTB |= (1<<PB0)|(1<<PB1)|(1<<PB2)|(1<<PB3); // PB3:0 풀업
@@ -32,10 +35,10 @@ typedef struct {
 	uint8_t fast;
 	} speed;
 
-
 speed Motor_state;
 
 
+// 버튼 감지 로직
 void condition()
 {
 	uint8_t pins = PINB;
@@ -78,6 +81,8 @@ void condition()
 	return;
 }
 
+
+//모터 실질 구동 함수
 void Motor_Active(speed Motor_state)
 {
 	int duty = 0;
@@ -99,14 +104,15 @@ void Motor_Active(speed Motor_state)
 		duty = 250;
 	}
 	
-	OCR3B = duty;
+	OCR3B = duty; // 듀티비를 마지막에 바꾸어서, 다음 입력이 들어올 때까지 유지
 }
+
 
 
 int main(void)
 {
     GPIO_PWM_init();
-    while (1) 
+    while (1) // 버튼 누름 감지 로직 + 모터 동작 로직 반복
     {
 		condition();
 		Motor_Active(Motor_state);	
