@@ -4,7 +4,8 @@
  * Created: 2019-09-24 오후 7:49:32
  *  Author: jong oh Park
  */ 
-#define F_CPU 16000000UL
+
+#define  F_CPU 16000000UL
 #include <avr/io.h>
 #include <util/delay.h>
 #include "lcd.h"
