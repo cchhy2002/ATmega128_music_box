@@ -1,5 +1,5 @@
 /*
- * HX711 + PWM + LCD 통합 모듈 예제 (리팩토링 버전)
+ * HX711 + PWM + LCD + WS2812B + Pump 통합 예제 (리팩토링+확장 버전)
  *
  * - HX711 raw 값을 읽어서 LCD 2줄로 표시
  *   1줄: "Speed Level X"
@@ -10,7 +10,11 @@
  *   SCK  : PD1
  *
  * - 현재는 HX711 raw 값으로 speed_level(0~3)을 직접 결정
- *   (버튼은 디버깅용으로만 남겨둠)
+ *   (버튼은 디버깅용 + 펌프 제어용)
+ *
+ * - DC 모터: Timer3 OC3B(PE4) 10bit Fast PWM
+ * - WS2812B: PE2, 비트뱅잉 (GRB)
+ * - 솔레노이드 펌프: PE6, PB0(active-low) 버튼을 누르는 동안 동작
  */
 
 #ifndef F_CPU
@@ -20,6 +24,8 @@
 #include <avr/io.h>
 #include <util/delay.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <avr/interrupt.h>
 #include "lcd.h"   // MCU_Init(), LCDInit(), LCDCommand(), LCDMove(), LCDPuts() 등
 
 // ===================== 공통 전역 변수 =====================
@@ -28,17 +34,47 @@
 volatile unsigned long g_hx711_raw = 0;
 
 // 모터/속도 제어용 상태 플래그 (0~3)
-volatile uint8_t g_speed_level = 0;   // 0: stop, 1/2/3: 점점 빠르게
+volatile uint8_t  g_speed_level = 0;   // 0: stop, 1/2/3: 점점 빠르게
 
 // 모터 PWM duty (0~1023, Fast PWM 10bit)
 volatile uint16_t g_duty = 0;
+
+// 전역 millis 카운터 (1ms 단위)
+volatile uint32_t g_millis = 0;
+
+// ===================== 타이머0 기반 1ms tick / millis() =====================
+
+// Timer0 Compare Match ISR: 1ms마다 호출되도록 설정
+ISR(TIMER0_COMP_vect)
+{
+    g_millis++;
+}
+
+// Timer0: CTC 모드, 1ms 주기 인터럽트
+void Timer0_init(void)
+{
+    // F_CPU = 16MHz, prescaler = 64
+    // 16MHz / 64 = 250kHz → 1ms = 250카운트 → 0~249
+    TCCR0 = (1 << WGM01) | (1 << CS01) | (1 << CS00); // CTC 모드, 분주 64
+    OCR0  = 249;                                      // 1ms마다 비교 일치
+    TIMSK |= (1 << OCIE0);                            // Timer0 Compare Match 인터럽트 enable
+}
+
+// 현재까지 누적된 ms 반환 (인터럽트 구간 보호)
+uint32_t millis(void)
+{
+    uint32_t m;
+    cli();
+    m = g_millis;
+    sei();
+    return m;
+}
 
 // ===================== HX711 필터 / 레벨 임계값 =====================
 
 // 1차 저역 필터(지수 이동 평균) 계수: out = (9/10)*out + (1/10)*in
 #define HX_FILTER_ALPHA_NUM   9
 #define HX_FILTER_ALPHA_DEN   10
-
 
 // 각 레벨 사이의 중간값을 임계값으로 사용
 #define TH_01 348000UL   // 0↔1 경계
@@ -176,12 +212,12 @@ void HX_711_Update(void)
     g_speed_level = level;
 }
 
-// ===================== 버튼 관련 (디버깅용) =====================
+// ===================== 버튼 관련 (디버깅 + 펌프용) =====================
 
 // PB0, PB1, PB2 사용
-#define BTN_LV1   PB0   // 누르면 speed_level = 1
-#define BTN_LV2   PB1   // 누르면 speed_level = 2
-#define BTN_LV3   PB2   // 누르면 speed_level = 3
+#define BTN_LV1   PB0   // 누르면 Level 1 / 펌프 트리거
+#define BTN_LV2   PB1   // 디버깅용 Level 2
+#define BTN_LV3   PB2   // 디버깅용 Level 3
 
 void Button_init(void)
 {
@@ -209,23 +245,14 @@ void Button_Update(void)
 }
 
 // ===================== 모터 / PWM 관련 =====================
-// L298N 기준:
-// PE4 : ENA (PWM, OC3B)
-// PE5 : IN1
-// PE6 : IN2
+// DC 모터는 이제 ENA(PE4: OC3B)만 사용한다고 가정 (L298N IN1/IN2 미사용)
 
 #define MOTOR_EN   PE4   // OC3B
-#define MOTOR_IN1  PE5
-#define MOTOR_IN2  PE6
 
 void Motor_init(void)
 {
-    // 모터 제어 핀 출력 설정
-    DDRE |= (1 << MOTOR_EN) | (1 << MOTOR_IN1) | (1 << MOTOR_IN2);
-
-    // 초기 방향: IN1=HIGH, IN2=LOW → 정방향
-    PORTE |=  (1 << MOTOR_IN1);
-    PORTE &= ~(1 << MOTOR_IN2);
+    // 모터 PWM 핀 출력 설정
+    DDRE |= (1 << MOTOR_EN);
 
     // Timer3 모두 초기화
     TCCR3A = 0;
@@ -241,19 +268,15 @@ void Motor_init(void)
 }
 
 // HX_711에서 결정된 상태 플래그(g_speed_level)에 따라 duty 결정
-//  state 3 -> duty 1023
-//  state 2 -> duty  770
-//  state 1 -> duty  530
-//  state 0 -> duty    0
 void Motor_Condition(void)
 {
     switch (g_speed_level)
     {
-        case 3:  g_duty = 1023; break;
-        case 2:  g_duty =  770; break;
-        case 1:  g_duty =  530; break;
+        case 3:  g_duty = 300; break;
+        case 2:  g_duty = 230; break;
+        case 1:  g_duty = 175; break;
         case 0:
-        default: g_duty =    0; break;
+        default: g_duty =   0; break;
     }
 }
 
@@ -261,6 +284,219 @@ void Motor_Condition(void)
 void Motor_Active(void)
 {
     OCR3B = g_duty;
+}
+
+// ===================== WS2812B / LED 관련 =====================
+// - PE2 사용 (GRB 순서)
+// - LED_init(), LED_Condition(), LED_Update()
+
+#define WS2812_PORT  PORTE
+#define WS2812_DDR   DDRE
+#define WS2812_BIT   2        // PE2
+#define LED_PIN      PE2
+#define NUM_LEDS     4
+
+typedef struct {
+    uint8_t g;
+    uint8_t r;
+    uint8_t b;
+} NeoPixel;
+
+volatile NeoPixel g_led_buf[NUM_LEDS];
+
+// 깜빡임용 상태: ON일 때 색, 깜빡임 주기(ms)
+volatile uint16_t g_led_interval_ms = 0;  // 몇 ms마다 ON/OFF 토글할지
+volatile uint8_t  g_led_color_r     = 0;
+volatile uint8_t  g_led_color_g     = 0;
+volatile uint8_t  g_led_color_b     = 0;
+
+// 바이트 하나(8비트)를 WS2812 규격으로 보내는 함수 (어셈블리 기반)
+static inline void ws2812_sendByte(uint8_t byte)
+{
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        if (byte & 0x80)
+        {
+            // ===== '1' 비트 패턴 =====
+            asm volatile (
+                // HIGH 구간 (길게)
+                "sbi %[port], %[bit] \n\t"          // 2 clk
+                "nop \n\t""nop \n\t""nop \n\t"      // 3
+                "nop \n\t""nop \n\t""nop \n\t"      // 3 -> 총 6 NOP = 6 clk
+
+                // LOW 구간 (짧게)
+                "cbi %[port], %[bit] \n\t"          // 2 clk
+                "nop \n\t""nop \n\t""nop \n\t"      // 3 clk
+                :
+                : [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
+                  [bit]  "I" (WS2812_BIT)
+            );
+        }
+        else
+        {
+            // ===== '0' 비트 패턴 =====
+            asm volatile (
+                // HIGH 구간 (짧게)
+                "sbi %[port], %[bit] \n\t"          // 2 clk
+                "nop \n\t""nop \n\t"                // 2 clk
+
+                // LOW 구간 (길게)
+                "cbi %[port], %[bit] \n\t"          // 2 clk
+                "nop \n\t""nop \n\t""nop \n\t"      // 3
+                "nop \n\t""nop \n\t""nop \n\t"      // 3 -> 6 clk
+                :
+                : [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
+                  [bit]  "I" (WS2812_BIT)
+            );
+        }
+
+        byte <<= 1;   // 다음 비트로 이동
+    }
+}
+
+static void ws2812_show(void)
+{
+    // 타이밍 정확도를 위해 인터럽트 잠시 비활성
+    cli();
+    for (uint8_t i = 0; i < NUM_LEDS; i++)
+    {
+        // GRB 순서
+        ws2812_sendByte(g_led_buf[i].g);
+        ws2812_sendByte(g_led_buf[i].r);
+        ws2812_sendByte(g_led_buf[i].b);
+    }
+    sei();
+
+    // 리셋 (LOW > 50us)
+    _delay_us(60);
+}
+
+void LED_init(void)
+{
+    WS2812_DDR |= (1 << LED_PIN);        // 출력
+    WS2812_PORT &= ~(1 << LED_PIN);      // LOW
+
+    for (uint8_t i = 0; i < NUM_LEDS; i++)
+    {
+        g_led_buf[i].g = 0;
+        g_led_buf[i].r = 0;
+        g_led_buf[i].b = 0;
+    }
+
+    ws2812_show(); // 초기 상태(OFF) 전송
+}
+
+// Condition: g_speed_level에 따라 색/깜빡임 주기(ms) 설정
+// 0: OFF
+// 1: WHITE (10,10,10), 300ms마다 ON/OFF 토글
+// 2: WHITE (10,10,10), 200ms마다 ON/OFF 토글
+// 3: WHITE (10,10,10), 100ms마다 ON/OFF 토글
+void LED_Condition(void)
+{
+    uint8_t  r = 0, g = 0, b = 0;
+    uint16_t interval = 0;   // ms 단위
+
+    switch (g_speed_level)
+    {
+        case 1:
+            r = g = b = 20;
+            interval = 200;   // 300ms마다 ON/OFF 토글
+            break;
+        case 2:
+            r = g = b = 20;
+            interval = 100;   // 200ms마다 ON/OFF 토글
+            break;
+        case 3:
+            r = g = b = 20;
+            interval = 50;   // 100ms마다 ON/OFF 토글
+            break;
+        case 0:
+        default:
+            r = g = b = 0;
+            interval = 0;     // 깜빡임 없음 (항상 OFF)
+            break;
+    }
+
+    g_led_color_r     = r;
+    g_led_color_g     = g;
+    g_led_color_b     = b;
+    g_led_interval_ms = interval;
+}
+
+// LED_Update() : millis() 기반으로 블로킹 없이 깜빡임 제어 + WS2812B 전송
+void LED_Update(void)
+{
+    static uint8_t  led_on         = 0;  // 현재 ON/OFF 상태
+    static uint32_t last_toggle_ms = 0;  // 마지막 토글 시각(ms)
+
+    uint16_t interval = g_led_interval_ms;
+    uint32_t now      = millis();
+
+    if (interval == 0)
+    {
+        // speed_level 0: 항상 꺼짐
+        led_on         = 0;
+        last_toggle_ms = now;
+
+        for (uint8_t i = 0; i < NUM_LEDS; i++)
+        {
+            g_led_buf[i].g = 0;
+            g_led_buf[i].r = 0;
+            g_led_buf[i].b = 0;
+        }
+        ws2812_show();
+        return;
+    }
+
+    // interval(ms) 이상 경과하면 ON/OFF 토글
+    if ((uint32_t)(now - last_toggle_ms) >= interval)
+    {
+        last_toggle_ms = now;
+        led_on = !led_on;
+
+        uint8_t r = led_on ? g_led_color_r : 0;
+        uint8_t g = led_on ? g_led_color_g : 0;
+        uint8_t b = led_on ? g_led_color_b : 0;
+
+        for (uint8_t i = 0; i < NUM_LEDS; i++)
+        {
+            g_led_buf[i].g = g;
+            g_led_buf[i].r = r;
+            g_led_buf[i].b = b;
+        }
+        ws2812_show();
+    }
+    // 아직 interval이 안 지났으면 아무 것도 안 함 (비블로킹)
+}
+
+// ===================== 솔레노이드 펌프 관련 =====================
+// - PE6 사용
+// - PB0(active-low)을 누르는 동안 ON
+// - 완전 비블로킹
+
+#define PUMP_PIN   PE6
+
+void Pump_init(void)
+{
+    DDRE |= (1 << PUMP_PIN);      // 출력
+    PORTE &= ~(1 << PUMP_PIN);    // OFF
+}
+
+// PB0 버튼 상태에 따라 펌프 ON/OFF
+void Pump_Update(void)
+{
+    static bool pump_on = false;
+
+    // 액티브 로우: 눌리면 0
+    if (!(PINB & (1 << BTN_LV1)))
+        pump_on = true;
+    else
+        pump_on = false;
+
+    if (pump_on)
+        PORTE |= (1 << PUMP_PIN);
+    else
+        PORTE &= ~(1 << PUMP_PIN);
 }
 
 // ===================== LCD 관련 =====================
@@ -322,8 +558,12 @@ int main(void)
 {
     LCD_init();
     HX_711_Init();
-    Button_init();    // 디버깅용
+    Button_init();    // 디버깅 + 펌프 입력용
     Motor_init();
+    LED_init();
+    Pump_init();
+    Timer0_init();    // 1ms tick 타이머
+    sei();            // 전역 인터럽트 enable (Timer0 + 기타)
 
     while (1)
     {
@@ -331,13 +571,18 @@ int main(void)
         HX_711_Update();   // raw 기반으로 g_speed_level 결정
 
         // ↓ 디버깅용: 버튼으로 speed_level 강제 제어하고 싶으면 주석 해제
-        // Button_Update();
+        //Button_Update();
 
         Motor_Condition(); // g_speed_level만 보고 duty 결정
-        Motor_Active();
+        Motor_Active();    // PWM 반영
 
         LCD_update();      // Speed Level + raw + duty 표시
 
-        _delay_ms(100);
+        LED_Condition();   // g_speed_level 기준 색/주기 설정
+        LED_Update();      // millis() 기반으로 네오픽셀 깜빡임 제어
+
+        Pump_Update();     // PB0 상태 기반 솔레노이드 펌프 제어 (비블로킹)
+
+        _delay_ms(40);     // 루프 주기 완화용 (타이밍은 Timer0가 관리)
     }
 }
