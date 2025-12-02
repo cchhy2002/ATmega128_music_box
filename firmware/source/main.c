@@ -77,9 +77,9 @@ uint32_t millis(void)
 #define HX_FILTER_ALPHA_DEN   10
 
 // 각 레벨 사이의 중간값을 임계값으로 사용
-#define TH_01 348000UL   // 0↔1 경계
-#define TH_12 295000UL   // 1↔2 경계
-#define TH_23 242000UL   // 2↔3 경계
+#define TH_01 360000UL   // 0↔1 경계
+#define TH_12 282000UL   // 1↔2 경계
+#define TH_23 225000UL   // 2↔3 경계
 
 // ===================== HX711 관련 (PORTD) =====================
 // DOUT : PD0
@@ -154,7 +154,7 @@ void HX_711_Init(void)
 // HX711 구동: 여러 번 읽어 평균 내고 EMA 필터 적용
 void HX_711_Active(void)
 {
-    const uint8_t N = 5;
+    const uint8_t N = 3;
     unsigned long acc = 0;
 
     // 1) N회 샘플링해서 평균 (노이즈 감소)
@@ -311,48 +311,78 @@ volatile uint8_t  g_led_color_g     = 0;
 volatile uint8_t  g_led_color_b     = 0;
 
 // 바이트 하나(8비트)를 WS2812 규격으로 보내는 함수 (어셈블리 기반)
+// 바이트 하나(8비트)를 WS2812 규격으로 보내는 함수 (어셈블리 기반, 16MHz 기준)
 static inline void ws2812_sendByte(uint8_t byte)
 {
-    for (uint8_t i = 0; i < 8; i++)
-    {
-        if (byte & 0x80)
-        {
-            // ===== '1' 비트 패턴 =====
-            asm volatile (
-                // HIGH 구간 (길게)
-                "sbi %[port], %[bit] \n\t"          // 2 clk
-                "nop \n\t""nop \n\t""nop \n\t"      // 3
-                "nop \n\t""nop \n\t""nop \n\t"      // 3 -> 총 6 NOP = 6 clk
+	for (uint8_t i = 0; i < 8; i++)
+	{
+		if (byte & 0x80)
+		{
+			// ===== '1' 비트 패턴 =====
+			// HIGH를 더 길게, LOW를 약간 짧게 → T1H ~0.75~0.8us, T1L ~0.5us 근사
+			asm volatile (
+			// HIGH 구간 (길게)
+			"sbi  %[port], %[bit]      \n\t"  // 2 clk
+			"nop                       \n\t"  // 1
+			"nop                       \n\t"  // 2
+			"nop                       \n\t"  // 3
+			"nop                       \n\t"  // 4
+			"nop                       \n\t"  // 5
+			"nop                       \n\t"  // 6
+			"nop                       \n\t"  // 7
+			"nop                       \n\t"  // 8
+			"nop                       \n\t"  // 9
+			"nop                       \n\t"  // 10  → HIGH 총 12clk(2+10)
 
-                // LOW 구간 (짧게)
-                "cbi %[port], %[bit] \n\t"          // 2 clk
-                "nop \n\t""nop \n\t""nop \n\t"      // 3 clk
-                :
-                : [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
-                  [bit]  "I" (WS2812_BIT)
-            );
-        }
-        else
-        {
-            // ===== '0' 비트 패턴 =====
-            asm volatile (
-                // HIGH 구간 (짧게)
-                "sbi %[port], %[bit] \n\t"          // 2 clk
-                "nop \n\t""nop \n\t"                // 2 clk
+			// LOW 구간 (짧게)
+			"cbi  %[port], %[bit]      \n\t"  // 2 clk
+			"nop                       \n\t"  // 1
+			"nop                       \n\t"  // 2
+			"nop                       \n\t"  // 3
+			"nop                       \n\t"  // 4
+			"nop                       \n\t"  // 5
+			"nop                       \n\t"  // 6  → LOW 8clk(2+6)
+			:
+			: [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
+			[bit]  "I" (WS2812_BIT)
+			);
+		}
+		else
+		{
+			// ===== '0' 비트 패턴 =====
+			// HIGH를 짧게, LOW를 더 길게 → T0H ~0.37~0.4us, T0L ~0.87us 근사
+			asm volatile (
+			// HIGH 구간 (짧게)
+			"sbi  %[port], %[bit]      \n\t"  // 2 clk
+			"nop                       \n\t"  // 1
+			"nop                       \n\t"  // 2
+			"nop                       \n\t"  // 3
+			"nop                       \n\t"  // 4  → HIGH 6clk(2+4)
 
-                // LOW 구간 (길게)
-                "cbi %[port], %[bit] \n\t"          // 2 clk
-                "nop \n\t""nop \n\t""nop \n\t"      // 3
-                "nop \n\t""nop \n\t""nop \n\t"      // 3 -> 6 clk
-                :
-                : [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
-                  [bit]  "I" (WS2812_BIT)
-            );
-        }
+			// LOW 구간 (길게)
+			"cbi  %[port], %[bit]      \n\t"  // 2 clk
+			"nop                       \n\t"  // 1
+			"nop                       \n\t"  // 2
+			"nop                       \n\t"  // 3
+			"nop                       \n\t"  // 4
+			"nop                       \n\t"  // 5
+			"nop                       \n\t"  // 6
+			"nop                       \n\t"  // 7
+			"nop                       \n\t"  // 8
+			"nop                       \n\t"  // 9
+			"nop                       \n\t"  // 10
+			"nop                       \n\t"  // 11
+			"nop                       \n\t"  // 12  → LOW 14clk(2+12)
+			:
+			: [port] "I" (_SFR_IO_ADDR(WS2812_PORT)),
+			[bit]  "I" (WS2812_BIT)
+			);
+		}
 
-        byte <<= 1;   // 다음 비트로 이동
-    }
+		byte <<= 1;   // 다음 비트로 이동 (이 부분은 C 코드라, 사이클 여유분 확보 겸용)
+	}
 }
+
 
 static void ws2812_show(void)
 {
@@ -399,16 +429,16 @@ void LED_Condition(void)
     switch (g_speed_level)
     {
         case 1:
-            r = g = b = 20;
-            interval = 200;   // 300ms마다 ON/OFF 토글
+            r = g = b = 15;
+            interval = 650;   // 300ms마다 ON/OFF 토글
             break;
         case 2:
-            r = g = b = 20;
-            interval = 100;   // 200ms마다 ON/OFF 토글
+            r = g = b = 15;
+            interval = 450;   // 200ms마다 ON/OFF 토글
             break;
         case 3:
-            r = g = b = 20;
-            interval = 50;   // 100ms마다 ON/OFF 토글
+            r = g = b = 15;
+            interval = 250;   // 100ms마다 ON/OFF 토글
             break;
         case 0:
         default:
@@ -571,7 +601,7 @@ int main(void)
         HX_711_Update();   // raw 기반으로 g_speed_level 결정
 
         // ↓ 디버깅용: 버튼으로 speed_level 강제 제어하고 싶으면 주석 해제
-        //Button_Update();
+        // Button_Update();
 
         Motor_Condition(); // g_speed_level만 보고 duty 결정
         Motor_Active();    // PWM 반영
@@ -583,6 +613,6 @@ int main(void)
 
         Pump_Update();     // PB0 상태 기반 솔레노이드 펌프 제어 (비블로킹)
 
-        _delay_ms(40);     // 루프 주기 완화용 (타이밍은 Timer0가 관리)
+        _delay_ms(30);     // 루프 주기 완화용 (타이밍은 Timer0가 관리)
     }
 }
